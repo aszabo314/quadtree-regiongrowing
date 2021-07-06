@@ -19,6 +19,7 @@ type NodeData =
     {
         idx : int
         density : float
+        centroid : V2d
         mutable parent : Option<QuadTree>
         location : list<int>
         level : int
@@ -55,15 +56,26 @@ module QuadTree =
         let rand = RandomSystem()
         let randBetween mi ma = rand.UniformDouble() * (ma-mi) + mi
         let lvl0Density = 1.0
-        let rec build (locationCode : list<int>) (density : float) (level : int) =
-            if density <= leafThreshold then Leaf {idx = idx(); density = density; parent = None; location = locationCode; level = level}
+        let rec build (mi : V2d) (ma : V2d) (locationCode : list<int>) (density : float) (level : int) =
+            if density <= leafThreshold then Leaf {centroid = (mi+ma)/2.0; idx = idx(); density = density; parent = None; location = locationCode; level = level}
             else
+                let r = ma-mi
+                let p00 = mi
+                let p10 = V2d(mi.X + r.X/2.0, mi.Y)
+                let p20 = V2d(ma.X,           mi.Y)
+                let p01 = V2d(mi.X,           mi.Y + r.Y/2.0)
+                let p11 = V2d(mi.X + r.X/2.0, mi.Y + r.Y/2.0)
+                let p21 = V2d(ma.X,           mi.Y + r.Y/2.0)
+                let p02 = V2d(mi.X,           ma.Y)
+                let p12 = V2d(mi.X + r.X/2.0, ma.Y)
+                let p22 = ma
+
                 let parts = Array.init 4 (fun _ -> randBetween 0.0 density) |> Array.sort
-                let bl = build (locationCode@[2]) parts.[0] (level+1)
-                let tl = build (locationCode@[0]) (parts.[1]-parts.[0]) (level+1)
-                let tr = build (locationCode@[1]) (parts.[2]-parts.[1]) (level+1)
-                let br = build (locationCode@[3]) (parts.[3]-parts.[2]) (level+1)
-                Node({idx = idx(); density = density; parent = None; location = locationCode; level = level}, bl, tl, tr, br)
+                let bl = build p01 p12 (locationCode@[2]) parts.[0] (level+1)
+                let tl = build p00 p11 (locationCode@[0]) (parts.[1]-parts.[0]) (level+1)
+                let tr = build p10 p21 (locationCode@[1]) (parts.[2]-parts.[1]) (level+1)
+                let br = build p11 p22 (locationCode@[3]) (parts.[3]-parts.[2]) (level+1)
+                Node({centroid = (mi+ma)/2.0; idx = idx(); density = density; parent = None; location = locationCode; level = level}, bl, tl, tr, br)
         let rec fixParents (p : Option<QuadTree>) (q : QuadTree) =
             match q with 
             | Leaf d -> d.parent <- p
@@ -74,7 +86,7 @@ module QuadTree =
                 fixParents (Some q) tr
                 fixParents (Some q) br
 
-        let res = build [] lvl0Density 0
+        let res = build V2d.NN V2d.II [] lvl0Density 0
         fixParents None res
         res
 
@@ -272,17 +284,23 @@ module Traversal =
         let startNode =
             let nodes = QuadTree.nodesOfLevel startLevel root |> List.toArray
             nodes.[rand.UniformInt(nodes.Length)]
+        let startPoint = (QuadTree.getData startNode).centroid
         let mutable finished = MapExt.empty
 
-        let queue = LinkedList<QuadTree>()
+        let queue = List<QuadTree>() //LinkedList<QuadTree>()
         let tryEnqueue (q : QuadTree) =
-            if not (finished |> MapExt.containsKey (QuadTree.getData q).idx) then queue.AddLast q |> ignore
-        let tryEnqueueFront (q : QuadTree) =
-            if not (finished |> MapExt.containsKey (QuadTree.getData q).idx) then queue.AddFirst q |> ignore
-
+            if not (finished |> MapExt.containsKey (QuadTree.getData q).idx) then 
+                queue.Add(q)
+                let comparer (l : QuadTree) (r : QuadTree) = 
+                    let dl = Vec.distance (QuadTree.getData l).centroid startPoint
+                    let dr = Vec.distance (QuadTree.getData r).centroid startPoint
+                    compare dl dr
+                queue.Sort(comparer)
+                //queue.AddLast q |> ignore
+                
         let dequeue() =
-            let res = queue.First.Value
-            queue.RemoveFirst()
+            let res = queue.[0]
+            queue.RemoveAt(0)
             res
 
         tryEnqueue startNode
