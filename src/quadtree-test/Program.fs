@@ -7,6 +7,8 @@ open Aardvark.Application.Slim
 open FSharp.Data.Adaptive
 open System.Collections.Generic
 open System.Threading
+open FSharp.Data.Adaptive
+let mutable maxLvl = -1
 let mutable ct = 0
 let idx() = 
     let res = ct
@@ -15,24 +17,46 @@ let idx() =
 
 type Dir = Left | Up | Right | Down
 
-type NodeData =
-    {
-        idx : int
-        density : float
-        centroid : V2d
-        mutable parent : Option<QuadTree>
-        location : list<int>
-        level : int
-    }
+[<AutoOpen>]
+module rec Stuff =
+    type NodeData =
+        {
+            idx : int
+            density : float
+            centroid : V2d
+            mutable parent : Option<QuadTree>
+            location : list<int>
+            level : int
+        }
 
-and QuadTree =
-| Node of NodeData*bl:QuadTree*tl:QuadTree*tr:QuadTree*br:QuadTree
-| Leaf of NodeData
+    [<CustomEquality; NoComparison>]
+    type QuadTree =
+    | Node of NodeData*bl:QuadTree*tl:QuadTree*tr:QuadTree*br:QuadTree
+    | Leaf of NodeData
+        with 
+            member x.Centroid = 
+                match x with
+                | Leaf d -> d.centroid
+                | Node (d,_,_,_,_) -> d.centroid
+                
+            member x.Id = 
+                match x with
+                | Leaf d -> d.idx
+                | Node (d,_,_,_,_) -> d.idx
 
+            override x.GetHashCode() = x.Id
+            override x.Equals(o) =
+                match o with 
+                | :? QuadTree as oq -> 
+                    x.Id = oq.Id
+                | _ -> false
+
+[<ReferenceEquality>]
 type Traversed =
     {
         startIdx : int
         visited : MapExt<int,bool>
+        pending : HashSet<QuadTree>
     }
 
 module Traversed =
@@ -40,6 +64,7 @@ module Traversed =
         {
             startIdx = -1
             visited = MapExt.empty
+            pending = HashSet.Empty
         }
 
 module QuadTree =
@@ -52,11 +77,13 @@ module QuadTree =
         (getData q).location
 
     let generate leafThreshold =
+        maxLvl <- 0
         ct <- 0
         let rand = RandomSystem()
         let randBetween mi ma = rand.UniformDouble() * (ma-mi) + mi
         let lvl0Density = 1.0
         let rec build (mi : V2d) (ma : V2d) (locationCode : list<int>) (density : float) (level : int) =
+            if level > maxLvl then maxLvl <- level
             if density <= leafThreshold then Leaf {centroid = (mi+ma)/2.0; idx = idx(); density = density; parent = None; location = locationCode; level = level}
             else
                 let r = ma-mi
@@ -71,6 +98,7 @@ module QuadTree =
                 let p22 = ma
 
                 let parts = Array.init 4 (fun _ -> randBetween 0.0 density) |> Array.sort
+                //let parts = [|0.25; 0.5; 0.75; 1.0|] |> Array.map (fun t -> t*density)
                 let bl = build p01 p12 (locationCode@[2]) parts.[0] (level+1)
                 let tl = build p00 p11 (locationCode@[0]) (parts.[1]-parts.[0]) (level+1)
                 let tr = build p10 p21 (locationCode@[1]) (parts.[2]-parts.[1]) (level+1)
@@ -99,6 +127,14 @@ module QuadTree =
                         V2d(mi.X,mi.Y);V2d(ma.X,mi.Y);V2d(ma.X,ma.Y);
                     |]
                 else [||]
+            let posgrn d =
+                if t.pending |> HashSet.contains d then 
+                    [|V2d(mi.X,mi.Y);V2d(mi.X,ma.Y);
+                      V2d(mi.X,ma.Y);V2d(ma.X,ma.Y);
+                      V2d(ma.X,ma.Y);V2d(ma.X,mi.Y);
+                      V2d(ma.X,mi.Y);V2d(mi.X,mi.Y);
+                    |]
+                else [||]
             let posylo d =
                 if t.startIdx = d.idx then 
                     [|
@@ -113,7 +149,7 @@ module QuadTree =
                   V2d(ma.X,ma.Y);V2d(ma.X,mi.Y);
                   V2d(ma.X,mi.Y);V2d(mi.X,mi.Y);
                 |]
-                pos, posred d, posylo d
+                pos, posred d, posylo d, posgrn q
             | Node(d, bl, tl, tr, br) -> 
                 let r = ma-mi
                 let p00 = mi
@@ -125,27 +161,30 @@ module QuadTree =
                 let p02 = V2d(mi.X,           ma.Y)
                 let p12 = V2d(mi.X + r.X/2.0, ma.Y)
                 let p22 = ma
-                let (pa0,pr0,py0) = traverse p00 p11 tl t
-                let (pa1,pr1,py1) = traverse p10 p21 tr t
-                let (pa2,pr2,py2) = traverse p01 p12 bl t
-                let (pa3,pr3,py3) = traverse p11 p22 br t
+                let (pa0,pr0,py0,pg0) = traverse p00 p11 tl t
+                let (pa1,pr1,py1,pg1) = traverse p10 p21 tr t
+                let (pa2,pr2,py2,pg2) = traverse p01 p12 bl t
+                let (pa3,pr3,py3,pg3) = traverse p11 p22 br t
 
                 Array.concat [pa0;pa1;pa2;pa3], 
                 Array.concat [pr0;pr1;pr2;pr3;posred d],
-                Array.concat [py0;py1;py2;py3;posylo d]
+                Array.concat [py0;py1;py2;py3;posylo d],
+                Array.concat [pg0;pg1;pg2;pg3;posgrn q]
         let positions mi ma q t =
             let res = traverse mi ma q t
             res
 
         let ps = AVal.map2 (fun q t -> positions (V2d(-1.0,1.0)) (V2d(1.0,-1.0)) q t) quad traversal
 
-        let whiteBoxes = ps |> AVal.map (fun (d,_,_) -> d)
-        let redTris =    ps |> AVal.map (fun (_,d,_) -> d)
-        let yloTris =    ps |> AVal.map (fun (_,_,d) -> d)
+        let whiteBoxes = ps |> AVal.map (fun (d,_,_,_) -> d)
+        let redTris =    ps |> AVal.map (fun (_,d,_,_) -> d)
+        let yloTris =    ps |> AVal.map (fun (_,_,d,_) -> d)
+        let grnLines =   ps |> AVal.map (fun (_,_,_,d) -> d)
 
         let pass0 = RenderPass.main
         let pass1 = RenderPass.after "asdasd" RenderPassOrder.Arbitrary RenderPass.main
         let pass2 = RenderPass.after "asdasd21354235" RenderPassOrder.Arbitrary pass1
+        let pass3 = RenderPass.after "43673457reth345z" RenderPassOrder.Arbitrary pass2
 
         let whiteSg =
             Sg.draw IndexedGeometryMode.LineList
@@ -172,8 +211,18 @@ module QuadTree =
             }
             |> Sg.blendMode (AVal.constant BlendMode.Blend)
             |> Sg.pass pass2
+        let grnSg =
+            Sg.draw IndexedGeometryMode.LineList
+            |> Sg.vertexAttribute DefaultSemantic.Positions grnLines
+            |> Sg.shader {
+                do! DefaultSurfaces.constantColor C4f.Blue
+                do! DefaultSurfaces.thickLine
+            }
+            |> Sg.uniform "LineWidth" (AVal.constant 1.25)
+            |> Sg.depthTest (AVal.constant DepthTest.None)
+            |> Sg.pass pass3
             
-        Sg.ofList [whiteSg;redSg;yloSg]
+        Sg.ofList [whiteSg;redSg;yloSg;grnSg]
 
     let rec findIdx (i : int) (q : QuadTree) =
         match q with 
@@ -205,7 +254,7 @@ module QuadTree =
                 | _ -> failwith ""
 
     let nodesOfLevel (l : int) (q : QuadTree) =
-        let l = clamp 0 (ct-1) l
+        let l = clamp 0 maxLvl l
         let rec traverse (i : int) (q : QuadTree) =
             match q with 
             | Leaf _ -> 
@@ -220,16 +269,27 @@ module QuadTree =
                     ]
         traverse l q
 
-    let rec containsPath (outer : list<int>) (inner : list<int>) = 
+    let rec strictlyContainsPath (outer : list<int>) (inner : list<int>) = 
         match outer,inner with 
-        | [], [] -> false
+        | [], [] -> true
         | [], _ -> true
         | _, [] -> false
         | o::router, i::rinner -> 
-            (o=i)&&(containsPath router rinner)
+            (o=i)&&(strictlyContainsPath router rinner)
 
-    let contains (outer : QuadTree) (inner : QuadTree) =
-        containsPath (getData outer).location (getData inner).location 
+    let strictlyContains (outer : QuadTree) (inner : QuadTree) =
+        strictlyContainsPath (getData outer).location (getData inner).location 
+
+    let rec containsOrEqualPath (outer : list<int>) (inner : list<int>) = 
+        match outer,inner with 
+        | [], [] -> true
+        | [], _ -> true
+        | _, [] -> false
+        | o::router, i::rinner -> 
+            (o=i)&&(containsOrEqualPath router rinner)
+
+    let containsOrEqual (outer : QuadTree) (inner : QuadTree) =
+        containsOrEqualPath (getData outer).location (getData inner).location 
 
 module Traversal =
     // http://web.archive.org/web/20120907211934/http://ww1.ucmss.com/books/LFS/CSREA2006/MSV4517.pdf
@@ -271,83 +331,97 @@ module Traversal =
                                 | Up    -> 1,None
                             | _ -> failwith ""
                         constructPath newDir remaining 
-                        |> Option.map (fun res -> res@[newLoc])
+                        |> Option.map (fun res -> newLoc::res)
                     | [] -> None
             constructPath (Some d) (List.rev l)
             |> Option.bind (fun path ->
-                QuadTree.findPath path root
+                QuadTree.findPath (List.rev path) root
             )
 
     let regionGrowFromRandomStart (startLevel : int) (root : QuadTree) (resCb : Traversed -> unit) =
-
         let rand = RandomSystem()
         let startNode =
             let nodes = QuadTree.nodesOfLevel startLevel root |> List.toArray
             nodes.[rand.UniformInt(nodes.Length)]
-        let startPoint = (QuadTree.getData startNode).centroid
+        let startPoint = startNode.Centroid
         let mutable finished = MapExt.empty
+        let mutable visited = HashSet.empty
+        let mutable queue = HashSet.empty
 
-        let queue = List<QuadTree>() //LinkedList<QuadTree>()
         let tryEnqueue (q : QuadTree) =
-            if not (finished |> MapExt.containsKey (QuadTree.getData q).idx) then 
-                queue.Add(q)
-                let comparer (l : QuadTree) (r : QuadTree) = 
-                    let dl = Vec.distance (QuadTree.getData l).centroid startPoint
-                    let dr = Vec.distance (QuadTree.getData r).centroid startPoint
-                    compare dl dr
-                queue.Sort(comparer)
-                //queue.AddLast q |> ignore
+            if not (finished |> MapExt.containsKey (QuadTree.getData q).idx) &&
+               not (visited |> HashSet.contains q)
+                then 
+                queue <- queue |> HashSet.add q
+                //queue.Add(q)
+
+                //let comparer (l : QuadTree) (r : QuadTree) = 
+                //    let dl = Vec.distance (QuadTree.getData l).centroid startPoint
+                //    let dr = Vec.distance (QuadTree.getData r).centroid startPoint
+                //    compare dl dr
+                //queue.Sort(comparer)
                 
         let dequeue() =
-            let res = queue.[0]
-            queue.RemoveAt(0)
-            res
+            let closest = queue |> HashSet.fold (fun mi c -> match mi with None -> Some c | Some m -> if Vec.distance c.Centroid startPoint < Vec.distance m.Centroid startPoint then Some c else Some m) None
+            match closest with 
+            | None -> None 
+            | Some c -> 
+                queue <- queue |> HashSet.remove c
+                Some c
 
-        tryEnqueue startNode
-        
         let rec tryEnqueueNeighbor (d : Dir) (q : QuadTree) =
             match getNeighbor d q root with 
             | Some n -> tryEnqueue n
             | None -> 
                 match (QuadTree.getData q).parent with 
                 | Some p -> 
-                    Log.line "try collapse %A" (QuadTree.path p)
                     tryEnqueueNeighbor d p
                 | None -> ()
 
-        while not (queue.IsEmpty()) do
-            let q = dequeue()
-            let mutable skip = false
-            if (QuadTree.getData q).level < startLevel then 
-                match q with 
-                | Leaf _ -> ()
-                | Node(_,bl,tl,tr,br) -> 
-                    Log.line "try split %A" (QuadTree.path q)
-                    tryEnqueue bl
-                    tryEnqueue tl
-                    tryEnqueue tr
-                    tryEnqueue br
-                    skip <- true
+        tryEnqueue startNode
+        let mutable running = true
+        while running do
+            //let q = dequeue()
+            //finished <- finished |> MapExt.add (QuadTree.getData q).idx true
+            //match getNeighbor Left q root with 
+            //| None -> ()
+            //| Some n -> 
+            //    queue.Add(n)
+            //Thread.Sleep 15
+            //resCb {startIdx = (QuadTree.getData startNode).idx; visited = finished; pending = queue |> CSharpList.toArray |> HashSet.ofArray}
 
-            if not skip then 
-                finished <- finished |> MapExt.add (QuadTree.getData q).idx true
-                resCb {startIdx = (QuadTree.getData startNode).idx; visited = finished}
-                Thread.Sleep 5
-
-                tryEnqueueNeighbor Left q
-                tryEnqueueNeighbor Up q
-                tryEnqueueNeighbor Right q
-                tryEnqueueNeighbor Down q
+            match dequeue() with 
+            | None -> running <- false
+            | Some q ->
+                visited <- visited |> HashSet.add q
+                let mutable skip = false
+                if (QuadTree.getData q).level < startLevel then 
+                    match q with 
+                    | Leaf _ -> ()
+                    | Node(_,bl,tl,tr,br) -> 
+                        tryEnqueue bl
+                        tryEnqueue tl
+                        tryEnqueue tr
+                        tryEnqueue br
+                        skip <- true
+                if not skip then 
+                    finished <- finished |> MapExt.add (QuadTree.getData q).idx true
+                    tryEnqueueNeighbor Left q
+                    tryEnqueueNeighbor Up q
+                    tryEnqueueNeighbor Right q
+                    tryEnqueueNeighbor Down q
+                resCb {startIdx = (QuadTree.getData startNode).idx; visited = finished; pending = queue}
+                Thread.Sleep 1
                 
         Log.line "done"
-        resCb {startIdx = (QuadTree.getData startNode).idx; visited = finished}
+        resCb {startIdx = (QuadTree.getData startNode).idx; visited = finished; pending = queue}
 
 [<EntryPoint;STAThread>]
 let main argv = 
     let mutable ver = 0
     let create() =
         Log.startTimed "generate ..."    
-        let res = QuadTree.generate 0.005
+        let res = QuadTree.generate 0.00015
         ver <- ver+1
         Log.stop()
         res
@@ -365,7 +439,7 @@ let main argv =
                 do! Async.Sleep 25
                 if lastVer <> ver then 
                     lastVer <- ver 
-                    Traversal.regionGrowFromRandomStart 4 (q |> AVal.force) (fun t -> transact (fun _ -> traversed.Value <- t))
+                    Traversal.regionGrowFromRandomStart 999 (q |> AVal.force) (fun t -> transact (fun _ -> traversed.Value <- t))
         } |> Async.Start
 
     let sg = QuadTree.toSg q traversed
