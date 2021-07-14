@@ -9,6 +9,7 @@ nuget Aardvark.Base.Incremental             ~> 5.1.9
 nuget Aardvark.Base.FSharp                  ~> 5.1.9
                                             
 nuget Aardvark.Rendering                    ~> 5.1.9
+nuget Aardvark.Rendering.Text               ~> 5.1.9
 nuget Aardvark.SceneGraph                   ~> 5.1.9
 nuget Aardvark.SceneGraph.IO                ~> 5.1.9
 nuget Aardvark.Application.Slim             ~> 5.1.9

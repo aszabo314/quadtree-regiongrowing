@@ -1,6 +1,7 @@
 ﻿open System
 open Aardvark.Base
 open Aardvark.Rendering
+open Aardvark.Rendering.Text
 open Aardvark.SceneGraph
 open Aardvark.Application
 open Aardvark.Application.Slim
@@ -43,6 +44,11 @@ module rec Stuff =
                 match x with
                 | Leaf d -> d.idx
                 | Node (d,_,_,_,_) -> d.idx
+                
+            member x.Level = 
+                match x with
+                | Leaf d -> d.level
+                | Node (d,_,_,_,_) -> d.level
 
             override x.GetHashCode() = x.Id
             override x.Equals(o) =
@@ -55,7 +61,7 @@ module rec Stuff =
 type Traversed =
     {
         startIdx : int
-        visited : MapExt<int,bool>
+        visited : MapExt<int,QuadTree>
         pending : HashSet<QuadTree>
     }
 
@@ -338,7 +344,7 @@ module Traversal =
                 QuadTree.findPath (List.rev path) root
             )
 
-    let regionGrowFromRandomStart (startLevel : int) (root : QuadTree) (resCb : Traversed -> unit) =
+    let regionGrowFromRandomStart (startLevel : int) (desiredLevel : unit -> int) (root : QuadTree) (resCb : Traversed -> unit) =
         let rand = RandomSystem()
         let startNode =
             let nodes = QuadTree.nodesOfLevel startLevel root |> List.toArray
@@ -347,21 +353,13 @@ module Traversal =
         let mutable finished = MapExt.empty
         let mutable visited = HashSet.empty
         let mutable queue = HashSet.empty
+        let mutable currentLevel = startLevel
 
-        let tryEnqueue (q : QuadTree) =
-            if not (finished |> MapExt.containsKey (QuadTree.getData q).idx) &&
-               not (visited |> HashSet.contains q)
-                then 
+        let enqueue (q : QuadTree) =
+            if not (visited |> HashSet.contains q) then 
                 queue <- queue |> HashSet.add q
-                //queue.Add(q)
-
-                //let comparer (l : QuadTree) (r : QuadTree) = 
-                //    let dl = Vec.distance (QuadTree.getData l).centroid startPoint
-                //    let dr = Vec.distance (QuadTree.getData r).centroid startPoint
-                //    compare dl dr
-                //queue.Sort(comparer)
                 
-        let dequeue() =
+        let tryDequeue() =
             let closest = queue |> HashSet.fold (fun mi c -> match mi with None -> Some c | Some m -> if Vec.distance c.Centroid startPoint < Vec.distance m.Centroid startPoint then Some c else Some m) None
             match closest with 
             | None -> None 
@@ -369,16 +367,16 @@ module Traversal =
                 queue <- queue |> HashSet.remove c
                 Some c
 
-        let rec tryEnqueueNeighbor (d : Dir) (q : QuadTree) =
+        let rec enqueueNeighbor (d : Dir) (q : QuadTree) =
             match getNeighbor d q root with 
-            | Some n -> tryEnqueue n
+            | Some n -> enqueue n
             | None -> 
                 match (QuadTree.getData q).parent with 
                 | Some p -> 
-                    tryEnqueueNeighbor d p
+                    enqueueNeighbor d p
                 | None -> ()
 
-        tryEnqueue startNode
+        enqueue startNode
         let mutable running = true
         while running do
             //let q = dequeue()
@@ -390,38 +388,54 @@ module Traversal =
             //Thread.Sleep 15
             //resCb {startIdx = (QuadTree.getData startNode).idx; visited = finished; pending = queue |> CSharpList.toArray |> HashSet.ofArray}
 
-            match dequeue() with 
+            currentLevel <- desiredLevel()
+            match tryDequeue() with 
             | None -> running <- false
             | Some q ->
                 visited <- visited |> HashSet.add q
                 let mutable skip = false
-                if (QuadTree.getData q).level < startLevel then 
+                if q.Level < currentLevel then 
                     match q with 
                     | Leaf _ -> ()
                     | Node(_,bl,tl,tr,br) -> 
-                        tryEnqueue bl
-                        tryEnqueue tl
-                        tryEnqueue tr
-                        tryEnqueue br
+                        enqueue bl
+                        enqueue tl
+                        enqueue tr
+                        enqueue br
                         skip <- true
                 if not skip then 
-                    finished <- finished |> MapExt.add (QuadTree.getData q).idx true
-                    tryEnqueueNeighbor Left q
-                    tryEnqueueNeighbor Up q
-                    tryEnqueueNeighbor Right q
-                    tryEnqueueNeighbor Down q
-                resCb {startIdx = (QuadTree.getData startNode).idx; visited = finished; pending = queue}
-                Thread.Sleep 1
+                    let mutable skipCurrent = false
+                    if q.Level > currentLevel then 
+                        match (QuadTree.getData q).parent with
+                        | None -> failwith "cant collapse root"
+                        | Some parent -> 
+                            let evil = finished |> MapExt.values |> Seq.exists(fun f -> QuadTree.containsOrEqual parent f)
+                            if evil then 
+                                ()
+                            else 
+                                enqueue parent
+                                skipCurrent <- true
+                    if not skipCurrent then 
+                        if not (finished |> MapExt.values |> Seq.exists(fun f -> QuadTree.containsOrEqual q f)) && 
+                           not (finished |> MapExt.values |> Seq.exists(fun f -> QuadTree.containsOrEqual f q)) then
+                            finished <- finished |> MapExt.add q.Id q
+                        enqueueNeighbor Left q
+                        enqueueNeighbor Up q
+                        enqueueNeighbor Right q
+                        enqueueNeighbor Down q
+
+                resCb {startIdx = startNode.Id; visited = finished; pending = queue}
+                Thread.Sleep 100
                 
         Log.line "done"
-        resCb {startIdx = (QuadTree.getData startNode).idx; visited = finished; pending = queue}
+        resCb {startIdx = startNode.Id; visited = finished; pending = queue}
 
 [<EntryPoint;STAThread>]
 let main argv = 
     let mutable ver = 0
     let create() =
         Log.startTimed "generate ..."    
-        let res = QuadTree.generate 0.00015
+        let res = QuadTree.generate 0.00005
         ver <- ver+1
         Log.stop()
         res
@@ -430,16 +444,20 @@ let main argv =
     Aardvark.Init()
 
     let traversed = cval Traversed.Empty
+    let startLevel = cval 6
+    let numberInput = cval [startLevel.Value]
+    let numberInputDisplay = numberInput |> AVal.map ((List.fold (fun (e,s) d -> (e+1),(s+d*Fun.Pown(10,e))) (0,0))>>snd)
+    let desiredLevel = cval startLevel.Value
 
     let doIt = 
         async {
             do! Async.SwitchToNewThread()
             let mutable lastVer = ver
             while true do 
-                do! Async.Sleep 25
+                do! Async.Sleep 5
                 if lastVer <> ver then 
                     lastVer <- ver 
-                    Traversal.regionGrowFromRandomStart 999 (q |> AVal.force) (fun t -> transact (fun _ -> traversed.Value <- t))
+                    Traversal.regionGrowFromRandomStart (startLevel |> AVal.force) (fun _ -> desiredLevel |> AVal.force) (q |> AVal.force) (fun t -> transact (fun _ -> traversed.Value <- t))
         } |> Async.Start
 
     let sg = QuadTree.toSg q traversed
@@ -450,11 +468,34 @@ let main argv =
     win.Keyboard.DownWithRepeats.Values.Add (fun k -> 
         match k with 
         | Keys.Space -> transact (fun _ -> q.Value <- create())
+        | Keys.O -> transact (fun _ -> startLevel.Value <- max (startLevel.Value-1) 0)
+        | Keys.P -> transact (fun _ -> startLevel.Value <- min (startLevel.Value+1) maxLvl)
+        | Keys.D0 -> transact (fun _ -> numberInput.Value <- 0::numberInput.Value)
+        | Keys.D1 -> transact (fun _ -> numberInput.Value <- 1::numberInput.Value)
+        | Keys.D2 -> transact (fun _ -> numberInput.Value <- 2::numberInput.Value)
+        | Keys.D3 -> transact (fun _ -> numberInput.Value <- 3::numberInput.Value)
+        | Keys.D4 -> transact (fun _ -> numberInput.Value <- 4::numberInput.Value)
+        | Keys.D5 -> transact (fun _ -> numberInput.Value <- 5::numberInput.Value)
+        | Keys.D6 -> transact (fun _ -> numberInput.Value <- 6::numberInput.Value)
+        | Keys.D7 -> transact (fun _ -> numberInput.Value <- 7::numberInput.Value)
+        | Keys.D8 -> transact (fun _ -> numberInput.Value <- 8::numberInput.Value)
+        | Keys.D9 -> transact (fun _ -> numberInput.Value <- 9::numberInput.Value)
+        | Keys.Enter -> transact (fun _ -> desiredLevel.Value <- numberInputDisplay |> AVal.force |> clamp 0 maxLvl; numberInput.Value <- [])
+        | Keys.Back -> transact (fun _ -> numberInput.Value <- match numberInput.Value with [] -> [] | _::t -> t)
         | _ -> ()
     )
 
+    let font = Aardvark.Rendering.Text.Font("Consolas")
+    let textSg =
+        let t = AVal.map3 (fun sl ni dl -> sprintf "run(SPACE)\nstartLevel(O/P)=%d\ndesiredLevel=%d\ninput desired level(DIGITS+ENTER):%d" sl dl ni) startLevel numberInputDisplay desiredLevel
+        Sg.text font C4b.White t
+        |> Sg.scale 0.025
+        |> Sg.transform (Trafo3d.Translation(-0.98,-0.85,0.0))
+
+
+    let finalSg = Sg.ofList [sg;textSg]
     let task =
-        app.Runtime.CompileRender(win.FramebufferSignature, sg)
+        app.Runtime.CompileRender(win.FramebufferSignature, finalSg)
 
     win.RenderTask <- task
     win.Run()
